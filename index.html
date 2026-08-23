@@ -1,0 +1,2264 @@
+<!DOCTYPE html>
+<html lang="es"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Sistema de purificación de agua para el hogar | Agenda tu videollamada</title>
+<meta name="description" content="Calcula cuánto te cuesta el agua embotellada en dinero y en plástico. Videollamada gratis de 20 minutos.">
+
+<meta property="og:type" content="website">
+<meta property="og:locale" content="es_ES">
+<meta property="og:title" content="Libérate del agua embotellada">
+<meta property="og:description" content="Videollamada gratis de 20 minutos. Sin visitas a tu casa. Sin compromiso.">
+<meta property="og:image" content="">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#04121F">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232EE6A8' d='M12 2s7 7.6 7 12a7 7 0 01-14 0c0-4.4 7-12 7-12z'/%3E%3C/svg%3E">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&amp;family=Fraunces:opsz,wght@9..144,400..700&amp;display=swap" rel="stylesheet">
+
+<style>
+/* ============================================================
+   1. TOKENS
+   ============================================================ */
+:root{
+  --abismo:#04121F; --profundo:#0A2438;
+  --cielo:#56C5E8; --aqua:#8FE3D8;
+  --verde:#2EE6A8; --verde-txt:#00241A;
+  --rojo:#FF7B7B;
+  --marfil:#F3F8FB; --plata:#9FBACD; --champan:#E8C68C;
+  --linea:rgba(159,186,205,.16);
+  --linea-luz:rgba(86,197,232,.42);
+  --vidrio:rgba(255,255,255,.035);
+  --display:"Fraunces",Georgia,serif;
+  --cuerpo:"Figtree",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --ancho:1180px; --aire:78px;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+body{margin:0; background:var(--abismo); color:var(--marfil);
+  font-family:var(--cuerpo); font-size:17px; line-height:1.62;
+  -webkit-font-smoothing:antialiased; overflow-x:hidden}
+body.bloqueado{overflow:hidden}
+h1,h2,h3{font-family:var(--display); font-variation-settings:"opsz" 72,"SOFT" 100,"WONK" 0;
+  font-weight:560; letter-spacing:-.022em; line-height:1.08; margin:0}
+p{margin:0}
+img{max-width:100%; display:block}
+a{color:var(--cielo)}
+::selection{background:rgba(46,230,168,.3); color:var(--marfil)}
+::-webkit-scrollbar{width:10px; height:10px}
+::-webkit-scrollbar-track{background:var(--abismo)}
+::-webkit-scrollbar-thumb{background:rgba(86,197,232,.3); border-radius:6px}
+:where(a,button,input,select,[tabindex]):focus-visible{
+  outline:2px solid var(--cielo); outline-offset:3px; border-radius:4px}
+.progreso{position:fixed; top:0; left:0; height:3px; width:0%; z-index:90;
+  background:linear-gradient(90deg,var(--cielo),var(--verde));
+  box-shadow:0 0 12px rgba(46,230,168,.7); transition:width .1s linear}
+
+/* ============================================================
+   2. ESTRUCTURA
+   ============================================================ */
+.env{width:100%; max-width:var(--ancho); margin-inline:auto; padding-inline:20px; position:relative; z-index:2}
+section{padding-block:var(--aire); position:relative}
+.franja-profunda{background:var(--profundo)}
+.halo{position:absolute; border-radius:50%; filter:blur(90px); opacity:.5; pointer-events:none; z-index:0}
+.cintillo{font-size:12px; font-weight:600; letter-spacing:.15em; text-transform:uppercase;
+  color:var(--cielo); margin:0 0 16px; display:flex; align-items:center; gap:10px}
+.cintillo::before{content:""; width:26px; height:1px; background:linear-gradient(90deg,transparent,var(--cielo)); flex:none}
+.t-seccion{font-size:clamp(26px,6.2vw,44px); max-width:22ch}
+.brillo{background:linear-gradient(100deg,currentColor 30%,rgba(255,255,255,.95) 48%,currentColor 62%);
+  background-size:260% 100%; -webkit-background-clip:text; background-clip:text;
+  -webkit-text-fill-color:transparent; background-position:180% 0}
+.brillo.visible{transition:background-position 1.5s ease .35s; background-position:-60% 0}
+
+/* ============================================================
+   3. BOTONES
+   ============================================================ */
+.btn{display:inline-flex; align-items:center; justify-content:center; gap:10px;
+  width:100%; min-height:60px; padding:18px 28px;
+  background:linear-gradient(135deg,#3BF0B6,#0FB98A); color:var(--verde-txt);
+  font-family:var(--cuerpo); font-size:17px; font-weight:700;
+  text-align:center; text-decoration:none; border:0; border-radius:13px; cursor:pointer;
+  box-shadow:0 0 0 1px rgba(255,255,255,.2) inset, 0 12px 34px -12px rgba(46,230,168,.75);
+  transition:transform .2s ease, box-shadow .2s ease, filter .2s ease;
+  position:relative; overflow:hidden}
+.btn:hover{transform:translateY(-2px); filter:brightness(1.07)}
+.btn:active{transform:translateY(0)}
+.btn::after{content:""; position:absolute; top:0; left:-120%; width:60%; height:100%;
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.5),transparent);
+  animation:destello 5.5s ease-in-out infinite}
+@keyframes destello{0%,72%{left:-120%} 88%,100%{left:130%}}
+.onda{position:absolute; border-radius:50%; transform:translate(-50%,-50%) scale(0);
+  background:rgba(255,255,255,.45); pointer-events:none; animation:ondear .6s ease-out forwards}
+@keyframes ondear{to{transform:translate(-50%,-50%) scale(2.6); opacity:0}}
+
+/* ============================================================
+   4. HERO
+   ============================================================ */
+.hero{padding-top:44px; padding-bottom:64px; overflow:hidden; text-align:center}
+.hero__halo-a{width:560px; height:560px; background:rgba(86,197,232,.28); top:-220px; left:-180px}
+.hero__halo-b{width:440px; height:440px; background:rgba(46,230,168,.13); top:160px; right:-200px}
+.hero h1{font-size:clamp(25px,5.3vw,52px); line-height:1.16; max-width:30ch;
+  margin:0 auto 24px; text-wrap:pretty}
+.hero h1 em{font-style:normal; background:linear-gradient(100deg,var(--cielo),var(--aqua));
+  -webkit-background-clip:text; background-clip:text; color:transparent}
+.video{position:relative; aspect-ratio:16/9; width:100%; max-width:900px; margin-inline:auto;
+  background:linear-gradient(160deg,#123A55,#08243A);
+  border:1px solid var(--linea-luz); border-radius:16px; overflow:hidden;
+  display:flex; align-items:center; justify-content:center; flex-direction:column;
+  gap:16px; text-align:center; padding:22px;
+  box-shadow:0 30px 70px -30px rgba(0,0,0,.9), 0 0 0 1px rgba(255,255,255,.05) inset}
+.video iframe,.video > div{position:absolute; inset:0; width:100%; height:100%; border:0}
+.video__txt{font-size:14px; color:var(--plata)}
+.video__play{width:66px; height:66px; border-radius:50%; display:grid; place-items:center;
+  color:var(--verde-txt); background:linear-gradient(135deg,#3BF0B6,#0FB98A);
+  animation:latido 3s ease-in-out infinite}
+@keyframes latido{0%,100%{box-shadow:0 0 0 8px rgba(46,230,168,.14), 0 0 34px rgba(46,230,168,.45)}
+  50%{box-shadow:0 0 0 16px rgba(46,230,168,0), 0 0 46px rgba(46,230,168,.75)}}
+.hero__cta{margin-top:26px; max-width:460px; margin-inline:auto}
+
+/* ============================================================
+   5. ¿ES PARA TI O NO?
+   ============================================================ */
+.filtro-sec{overflow:hidden}
+.burbujas{position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:0}
+.burbuja{position:absolute; bottom:-60px; border-radius:50%;
+  background:radial-gradient(circle at 32% 30%, rgba(255,255,255,.42), rgba(86,197,232,.10) 55%, transparent 70%);
+  border:1px solid rgba(86,197,232,.18); animation:subir linear infinite}
+@keyframes subir{0%{transform:translateY(0) translateX(0) scale(.85); opacity:0}
+  12%{opacity:.75} 88%{opacity:.5}
+  100%{transform:translateY(-115vh) translateX(var(--dx,20px)) scale(1.12); opacity:0}}
+.filtro{display:grid; grid-template-columns:1fr 1fr; gap:clamp(9px,2.2vw,24px); margin-top:34px; align-items:start}
+.col{border-radius:16px; padding:clamp(14px,3.4vw,32px) clamp(11px,2.8vw,28px);
+  border:1px solid var(--linea); background:var(--vidrio); position:relative;
+  transition:transform .35s cubic-bezier(.2,.7,.3,1), box-shadow .35s ease, border-color .35s ease}
+.col--si:hover,.col--si.tocada{transform:scale(1.035); border-color:var(--verde);
+  box-shadow:0 0 0 1px var(--verde), 0 0 38px rgba(46,230,168,.42)}
+.col--no:hover,.col--no.tocada{transform:scale(1.035); border-color:var(--rojo);
+  box-shadow:0 0 0 1px var(--rojo), 0 0 38px rgba(255,123,123,.36)}
+.col--si{background:linear-gradient(165deg,rgba(46,230,168,.10),rgba(46,230,168,.02))}
+.col--no{background:linear-gradient(165deg,rgba(255,123,123,.08),rgba(255,123,123,.015))}
+.col h3{font-size:clamp(15px,3.5vw,23px); line-height:1.2; margin-bottom:clamp(14px,2.6vw,22px);
+  display:flex; align-items:center; gap:8px}
+.col h3 svg{flex:none; width:clamp(18px,4vw,26px); height:auto}
+.col--si h3{color:var(--verde)}
+.col--no h3{color:var(--rojo)}
+.col ul{list-style:none; margin:0; padding:0; display:grid; gap:clamp(12px,2.2vw,18px)}
+.col li{display:flex; gap:clamp(7px,1.6vw,13px); align-items:flex-start}
+.col li > svg{flex:none; margin-top:4px; width:clamp(12px,2.6vw,17px); height:auto}
+.col--si li > svg{color:var(--verde)}
+.col--no li > svg{color:var(--rojo)}
+.col b{display:block; font-weight:700; font-size:clamp(12.5px,2.9vw,17px); line-height:1.3; margin-bottom:4px}
+.col--si b{color:var(--verde)}
+.col--no b{color:var(--rojo)}
+.col p{font-size:clamp(11.5px,2.4vw,15.5px); line-height:1.48}
+.col--si p{color:rgba(150,236,205,.78)}
+.col--no p{color:rgba(255,178,178,.72)}
+
+/* ============================================================
+   6. TESTIMONIOS
+   ============================================================ */
+.rejilla-test{margin-top:34px; display:grid; gap:16px; grid-template-columns:1fr}
+.testimonio{background:var(--vidrio); border:1px solid var(--linea); border-radius:16px;
+  padding:22px 20px; display:flex; flex-direction:column; gap:13px;
+  transition:border-color .3s ease, transform .35s ease, box-shadow .3s ease;
+  animation:aparece .5s backwards; transform-style:preserve-3d; position:relative}
+.testimonio:hover{border-color:var(--linea-luz); box-shadow:0 24px 50px -30px rgba(86,197,232,.6)}
+@keyframes aparece{from{opacity:0; transform:scale(.5)} to{opacity:1; transform:none}}
+.estrellas{display:flex; gap:3px; color:var(--champan)}
+.estrellas button{background:none; border:0; padding:0; cursor:pointer; color:inherit; line-height:0}
+.testimonio > p{font-size:16px; line-height:1.58; color:var(--marfil)}
+.test__pie{margin-top:auto; padding-top:14px; border-top:1px solid var(--linea); display:flex; align-items:center; gap:12px}
+.test__foto{width:46px; height:46px; border-radius:50%; flex:none; object-fit:cover;
+  border:1px solid var(--linea-luz); background:linear-gradient(160deg,#123A55,#08243A);
+  display:grid; place-items:center; font-size:16px; font-weight:700; color:var(--cielo)}
+.test__quien b{display:block; color:var(--cielo); font-weight:600; font-size:15px}
+.test__quien span{font-size:13.5px; color:var(--plata)}
+.ver-mas{margin-top:26px; display:flex; justify-content:center; gap:10px; flex-wrap:wrap}
+.ver-mas button{background:transparent; border:1px solid var(--linea-luz); color:var(--cielo);
+  font-family:var(--cuerpo); font-size:15.5px; font-weight:600; padding:14px 28px;
+  border-radius:12px; cursor:pointer; display:inline-flex; align-items:center; gap:9px;
+  transition:background .2s ease, transform .2s ease}
+.ver-mas button:hover{background:rgba(86,197,232,.1); transform:translateY(-2px)}
+.modal{position:fixed; inset:0; z-index:95; display:none;
+  background:rgba(4,18,31,.94); backdrop-filter:blur(10px); overflow-y:auto}
+.modal.abierto{display:block; animation:fundir .3s}
+@keyframes fundir{from{opacity:0} to{opacity:1}}
+.modal__cab{position:sticky; top:0; z-index:2; background:rgba(4,18,31,.92);
+  backdrop-filter:blur(10px); border-bottom:1px solid var(--linea);
+  padding:16px 20px; display:flex; align-items:center; gap:14px}
+.modal__cab h3{font-size:19px; flex:1}
+.modal__cerrar{background:rgba(255,255,255,.06); border:1px solid var(--linea); color:var(--marfil);
+  width:42px; height:42px; border-radius:50%; cursor:pointer; display:grid; place-items:center; flex:none}
+.modal__cerrar:hover{background:rgba(255,255,255,.14); transform:rotate(90deg)}
+.modal__cuerpo{padding:24px 20px 60px; max-width:var(--ancho); margin-inline:auto}
+.modal__cuerpo .rejilla-test{margin-top:0}
+
+/* ============================================================
+   7. CALCULADORA
+   ============================================================ */
+.calc{overflow:hidden}
+.calc__halo{width:620px; height:620px; background:rgba(86,197,232,.16); top:-140px; left:50%; transform:translateX(-50%)}
+.particulas{position:absolute; inset:0; overflow:hidden; pointer-events:none; z-index:0}
+.particula{position:absolute; border-radius:50%; background:rgba(86,197,232,.5);
+  box-shadow:0 0 8px rgba(86,197,232,.7); animation:derivar linear infinite}
+@keyframes derivar{0%{transform:translate(0,0); opacity:0} 15%{opacity:.85} 85%{opacity:.55}
+  100%{transform:translate(var(--px,40px),var(--py,-90px)); opacity:0}}
+.calc__intro{margin-top:20px; max-width:60ch; font-size:16.5px; color:var(--plata)}
+.calc__intro strong{color:var(--marfil); font-weight:600}
+.calc__panel{margin-top:30px;
+  background:linear-gradient(165deg,rgba(255,255,255,.055),rgba(255,255,255,.012));
+  border:1px solid var(--linea-luz); border-radius:20px; padding:24px 20px 28px;
+  box-shadow:0 30px 80px -40px rgba(86,197,232,.5)}
+.fase + .fase{margin-top:34px; padding-top:30px; border-top:1px solid var(--linea)}
+.fase__cab{display:flex; align-items:flex-start; gap:11px; margin-bottom:6px}
+.fase__ico{width:38px; height:38px; flex:none; border-radius:11px; display:grid; place-items:center;
+  border:1px solid var(--linea-luz); background:rgba(86,197,232,.1); color:var(--cielo)}
+.fase--verde .fase__ico{border-color:rgba(46,230,168,.45); background:rgba(46,230,168,.1); color:var(--verde)}
+.fase__tit{font-size:12px; font-weight:700; letter-spacing:.13em; text-transform:uppercase; color:var(--cielo)}
+.fase--verde .fase__tit{color:var(--verde)}
+.fase__exp{font-size:14.5px; line-height:1.5; color:var(--plata); margin-top:3px; max-width:46ch}
+.fase__cuerpo{margin-top:20px; display:grid; gap:24px}
+.campo{margin-bottom:14px}
+.campo:last-child{margin-bottom:0}
+.campo label{display:block; font-size:14.5px; color:var(--plata); margin-bottom:7px}
+.campo__fila{display:flex; gap:9px}
+.campo input,.campo select,.campo textarea{width:100%; min-height:52px; padding:12px 15px;
+  background:rgba(4,18,31,.6); border:1px solid var(--linea); border-radius:11px;
+  color:var(--marfil); font-family:var(--cuerpo); font-size:17px; font-weight:600;
+  transition:border-color .2s ease, box-shadow .2s ease}
+.campo textarea{min-height:90px; font-weight:400; font-size:14.5px; line-height:1.5; resize:vertical}
+.campo input:focus,.campo select:focus,.campo textarea:focus{border-color:var(--cielo); box-shadow:0 0 0 3px rgba(86,197,232,.16); outline:none}
+.campo select{cursor:pointer}
+.campo__fila select{flex:0 0 42%; font-weight:500}
+.campo input::-webkit-outer-spin-button,.campo input::-webkit-inner-spin-button{-webkit-appearance:none; margin:0}
+.campo input[type=number]{-moz-appearance:textfield}
+.res{border-radius:16px; padding:24px 18px; text-align:center;
+  border:1px solid var(--linea-luz); background:linear-gradient(165deg,rgba(86,197,232,.12),transparent);
+  transition:transform .35s cubic-bezier(.2,.7,.3,1), box-shadow .35s ease, border-color .35s ease}
+.res--verde{border-color:rgba(46,230,168,.45); background:linear-gradient(165deg,rgba(46,230,168,.12),transparent)}
+.res--verde:hover,.res--verde.tocada{transform:scale(1.025); border-color:var(--rojo);
+  box-shadow:0 0 0 1px var(--rojo), 0 0 40px rgba(255,123,123,.42)}
+.res--azul:hover,.res--azul.tocada{transform:scale(1.025); border-color:var(--cielo);
+  box-shadow:0 0 0 1px var(--cielo), 0 0 40px rgba(86,197,232,.45)}
+.res__eti{font-size:12.5px; letter-spacing:.09em; text-transform:uppercase; color:var(--plata); font-weight:600}
+.res__num{display:block; margin:10px 0 4px;
+  font-family:var(--display); font-variation-settings:"opsz" 96,"SOFT" 100;
+  font-weight:560; font-size:clamp(34px,8.6vw,60px); line-height:1.02; letter-spacing:-.035em;
+  font-variant-numeric:tabular-nums; color:var(--cielo); text-shadow:0 0 44px rgba(86,197,232,.45)}
+.res--verde .res__num{color:var(--verde); text-shadow:0 0 44px rgba(46,230,168,.4)}
+.res__sub{font-size:14px; color:var(--plata)}
+.mini{display:grid; grid-template-columns:1fr 1fr; margin-top:16px; border:1px solid var(--linea); border-radius:12px; overflow:hidden}
+.mini div{padding:15px 10px; text-align:center}
+.mini div + div{border-left:1px solid var(--linea)}
+.mini b{display:block; font-family:var(--display); font-variation-settings:"opsz" 60,"SOFT" 100;
+  font-weight:560; font-size:22px; font-variant-numeric:tabular-nums; color:var(--marfil)}
+.mini span{font-size:12.5px; color:var(--plata); line-height:1.35; display:block}
+.tarj-eti{margin-top:20px; font-size:13.5px; line-height:1.5; color:var(--marfil);
+  padding-top:16px; border-top:1px solid var(--linea)}
+.tarjetas{display:flex; flex-wrap:wrap; gap:4px; justify-content:center; margin-top:12px}
+.tarjeta{width:26px; height:17px; border-radius:3px;
+  background:linear-gradient(135deg,#56C5E8,#1F6E8C);
+  box-shadow:0 2px 6px rgba(0,0,0,.4); animation:aparece .4s backwards}
+.tarjeta::after{content:""; display:block; height:3px; margin-top:4px; background:rgba(255,255,255,.35)}
+.fuente{margin-top:26px; padding:20px 18px; border:1px solid var(--linea);
+  border-radius:14px; background:rgba(4,18,31,.45);
+  font-size:14px; line-height:1.65; color:rgba(159,186,205,.9)}
+.fuente h4{font-family:var(--cuerpo); font-size:12px; font-weight:700; letter-spacing:.13em;
+  text-transform:uppercase; color:var(--cielo); margin:0 0 12px}
+.fuente p + p{margin-top:11px}
+.fuente strong{color:var(--marfil); font-weight:600}
+.fuente a{color:var(--cielo); text-decoration:underline; text-underline-offset:3px}
+.calc__cta{margin-top:26px; max-width:460px}
+
+/* ============================================================
+   8. CIERRE
+   ============================================================ */
+.cierre{overflow:hidden; text-align:center}
+.cierre__halo{width:720px; height:720px; background:rgba(46,230,168,.15); bottom:-340px; left:50%; transform:translateX(-50%)}
+.cierre .cintillo{justify-content:center}
+.cierre h2{font-size:clamp(28px,6.8vw,46px)}
+.cierre h2 em{font-style:normal; color:var(--cielo)}
+.cierre__linea{color:var(--plata); margin:16px auto 0; max-width:34ch; font-size:17px}
+.calendly{margin-top:32px; border-radius:18px; overflow:hidden;
+  border:1px solid var(--linea-luz); box-shadow:0 40px 90px -40px rgba(0,0,0,.9)}
+
+/* ============================================================
+   9. AGENTE FLOTANTE
+   ============================================================ */
+.agente{position:fixed; right:16px; bottom:16px; z-index:60;
+  display:flex; align-items:center; gap:10px;
+  opacity:0; transform:translateY(20px) scale(.9); pointer-events:none;
+  transition:opacity .5s ease, transform .5s cubic-bezier(.2,.7,.3,1)}
+.agente.visible{opacity:1; transform:none; pointer-events:auto}
+.agente.oculto{opacity:0 !important; pointer-events:none !important}
+.agente__globo{background:var(--profundo); border:1px solid var(--linea-luz);
+  color:var(--marfil); font-size:13.5px; font-weight:500; line-height:1.35;
+  padding:10px 14px; border-radius:12px; max-width:168px; cursor:pointer;
+  box-shadow:0 10px 30px rgba(0,0,0,.5); animation:flotar 3.4s ease-in-out infinite}
+.agente__globo b{color:var(--verde)}
+@keyframes flotar{0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)}}
+.agente__btn{width:64px; height:64px; flex:none; border-radius:50%; border:0; cursor:pointer;
+  background:linear-gradient(135deg,#3BF0B6,#0FB98A); display:grid; place-items:center; overflow:hidden;
+  box-shadow:0 8px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(46,230,168,.55);
+  animation:pulso 2.6s ease-in-out infinite; transition:transform .25s ease}
+.agente__btn:hover{transform:scale(1.08)}
+@keyframes pulso{0%,100%{box-shadow:0 8px 28px rgba(0,0,0,.5), 0 0 0 0 rgba(46,230,168,.55)}
+  50%{box-shadow:0 8px 28px rgba(0,0,0,.5), 0 0 0 16px rgba(46,230,168,0)}}
+.robot{width:40px; height:40px; color:var(--verde-txt); animation:caminar 4.6s ease-in-out infinite}
+.robot .cuerpo{animation:brincar .62s ease-in-out infinite}
+.robot .pataI{transform-origin:9.5px 19px; animation:pataA .62s ease-in-out infinite}
+.robot .pataD{transform-origin:14.5px 19px; animation:pataB .62s ease-in-out infinite}
+.robot .ojos{animation:parpadeo 4.2s infinite}
+.robot .antena{transform-origin:12px 6px; animation:antenita 2.4s ease-in-out infinite}
+@keyframes caminar{0%,100%{transform:translateX(-6px) scaleX(1)} 46%{transform:translateX(6px) scaleX(1)}
+  50%{transform:translateX(6px) scaleX(-1)} 96%{transform:translateX(-6px) scaleX(-1)}}
+@keyframes brincar{0%,100%{transform:translateY(0)} 50%{transform:translateY(-1.1px)}}
+@keyframes pataA{0%,100%{transform:rotate(16deg)} 50%{transform:rotate(-16deg)}}
+@keyframes pataB{0%,100%{transform:rotate(-16deg)} 50%{transform:rotate(16deg)}}
+@keyframes parpadeo{0%,92%,100%{transform:scaleY(1)} 95%{transform:scaleY(.12)}}
+@keyframes antenita{0%,100%{transform:rotate(-9deg)} 50%{transform:rotate(9deg)}}
+.chat{position:fixed; right:14px; bottom:14px; z-index:61;
+  width:min(372px, calc(100vw - 28px)); max-height:min(640px, calc(100vh - 28px));
+  background:var(--profundo); border:1px solid var(--linea-luz);
+  border-radius:18px; overflow:hidden; display:none; flex-direction:column;
+  box-shadow:0 30px 80px rgba(0,0,0,.75)}
+.chat.abierto{display:flex; animation:subeChat .32s cubic-bezier(.2,.7,.3,1)}
+@keyframes subeChat{from{opacity:0; transform:translateY(24px) scale(.96)} to{opacity:1; transform:none}}
+.chat__cab{padding:14px 16px; display:flex; align-items:center; gap:12px;
+  border-bottom:1px solid var(--linea); background:rgba(4,18,31,.5)}
+.chat__ico{width:46px; height:46px; border-radius:50%; flex:none; display:grid; place-items:center;
+  overflow:hidden; background:linear-gradient(135deg,#3BF0B6,#0FB98A)}
+.chat__ico .robot{width:30px; height:30px}
+.chat__cab b{font-size:15px; display:block}
+.chat__cab > div > span{font-size:12.5px; color:var(--verde); display:flex; align-items:center; gap:5px}
+.chat__cab > div > span::before{content:""; width:6px; height:6px; border-radius:50%;
+  background:var(--verde); animation:latir 2s infinite}
+@keyframes latir{0%,100%{opacity:1} 50%{opacity:.35}}
+.chat__cerrar{margin-left:auto; background:none; border:0; color:var(--plata);
+  cursor:pointer; padding:6px; line-height:0; border-radius:6px}
+.chat__cerrar:hover{color:var(--marfil)}
+.chat__cuerpo{padding:16px; overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:12px}
+.msj{max-width:88%; padding:12px 14px; border-radius:14px; font-size:14.5px; line-height:1.52; animation:fundir .3s}
+.msj--bot{background:rgba(255,255,255,.06); border:1px solid var(--linea); border-bottom-left-radius:4px; align-self:flex-start}
+.msj--yo{background:linear-gradient(135deg,#3BF0B6,#0FB98A); color:var(--verde-txt);
+  font-weight:600; border-bottom-right-radius:4px; align-self:flex-end}
+.msj--cta{align-self:stretch; max-width:100%; padding:0; background:none; border:0}
+.msj--cta .btn{min-height:52px; font-size:16px}
+.chat__opciones{padding:12px 16px 16px; border-top:1px solid var(--linea); display:flex; flex-wrap:wrap; gap:8px}
+.chip{background:rgba(86,197,232,.1); border:1px solid var(--linea-luz); color:var(--cielo);
+  font-family:var(--cuerpo); font-size:13px; font-weight:500; padding:9px 13px;
+  border-radius:20px; cursor:pointer; text-align:left; transition:background .2s ease}
+.chip:hover{background:rgba(86,197,232,.2)}
+.chip--verde{background:rgba(46,230,168,.14); border-color:rgba(46,230,168,.5); color:var(--verde); font-weight:700}
+.chip--creador{background:transparent; border-color:var(--linea); color:var(--plata);
+  font-size:12px; display:inline-flex; align-items:center; gap:6px; margin-left:auto}
+.chip--creador:hover{background:rgba(255,255,255,.05); color:var(--marfil)}
+.escribiendo{display:flex; gap:4px; padding:14px}
+.escribiendo i{width:7px; height:7px; border-radius:50%; background:var(--plata); animation:puntos 1.2s infinite}
+.escribiendo i:nth-child(2){animation-delay:.18s}
+.escribiendo i:nth-child(3){animation-delay:.36s}
+@keyframes puntos{0%,60%,100%{opacity:.3; transform:translateY(0)} 30%{opacity:1; transform:translateY(-4px)}}
+
+/* ---------- Panel de creadores ---------- */
+.creador{position:absolute; inset:0; background:var(--profundo); z-index:3;
+  display:none; flex-direction:column}
+.creador.abierto{display:flex; animation:fundir .25s}
+.creador__cab{padding:14px 16px; display:flex; align-items:center; gap:10px;
+  border-bottom:1px solid var(--linea); background:rgba(4,18,31,.5)}
+.creador__cab b{font-size:15px}
+.creador__volver{background:none; border:0; color:var(--plata); cursor:pointer; padding:6px; line-height:0}
+.creador__volver:hover{color:var(--marfil)}
+.creador__cuerpo{padding:18px 16px; overflow-y:auto; flex:1}
+.creador h4{font-family:var(--cuerpo); font-size:12px; font-weight:700;
+  letter-spacing:.11em; text-transform:uppercase; color:var(--cielo); margin:22px 0 10px;
+  padding-top:16px; border-top:1px solid var(--linea)}
+.creador h4:first-child{margin-top:0; padding-top:0; border-top:0}
+.creador .pista{font-size:13px; color:var(--plata); line-height:1.5; margin-bottom:14px}
+.creador .campo label{font-size:13px}
+.creador .campo input,.creador .campo textarea{min-height:44px; font-size:14.5px; font-weight:500}
+.creador .campo textarea{min-height:80px}
+.creador__aviso{background:rgba(232,198,140,.09); border:1px solid rgba(232,198,140,.35);
+  border-radius:10px; padding:11px 13px; font-size:12.5px; line-height:1.55;
+  color:#F0DDBA; margin:14px 0}
+.creador__acciones{display:grid; gap:9px; margin-top:14px}
+.creador__sec{background:transparent; border:1px solid var(--linea); color:var(--marfil);
+  font-family:var(--cuerpo); font-size:14px; font-weight:600; min-height:46px;
+  border-radius:11px; cursor:pointer; transition:background .2s ease}
+.creador__sec:hover{background:rgba(255,255,255,.06)}
+.creador__sec--rojo{border-color:rgba(255,123,123,.4); color:var(--rojo)}
+.creador__ok{font-size:12.5px; color:var(--verde); margin-top:12px; line-height:1.5; word-break:break-word}
+.creador__err{font-size:12.5px; color:var(--rojo); margin-top:8px; min-height:16px}
+.creador .btn{min-height:48px; font-size:15px}
+.qa{border:1px solid var(--linea); border-radius:11px; padding:12px; margin-bottom:10px}
+.qa .campo{margin-bottom:9px}
+.qa__borrar{background:none; border:0; color:var(--rojo); font-size:12.5px;
+  font-family:var(--cuerpo); cursor:pointer; padding:4px 0}
+
+/* ============================================================
+   10. BOTÓN DE SONIDO
+   ============================================================ */
+.sonido{position:fixed; left:16px; bottom:16px; z-index:60;
+  width:46px; height:46px; border-radius:50%; cursor:pointer;
+  background:rgba(10,36,56,.85); backdrop-filter:blur(8px);
+  border:1px solid var(--linea-luz); color:var(--cielo);
+  display:none; place-items:center; box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.sonido.activo{display:grid}
+.sonido:hover{transform:scale(1.08)}
+.sonido.mudo{color:var(--plata)}
+.sonido.mudo .ondas{opacity:0}
+.sonido .tachado{opacity:0}
+.sonido.mudo .tachado{opacity:1}
+
+/* ============================================================
+   11. MODO EDICIÓN
+   ============================================================ */
+.barraEd{position:fixed; top:0; left:0; right:0; z-index:99;
+  background:linear-gradient(135deg,#3BF0B6,#0FB98A); color:var(--verde-txt);
+  display:none; align-items:center; gap:10px; padding:10px 14px; flex-wrap:wrap;
+  box-shadow:0 6px 24px rgba(0,0,0,.5)}
+body.editando .barraEd{display:flex}
+body.editando{padding-top:64px}
+.barraEd b{font-size:14px; font-weight:700; margin-right:auto; display:flex; align-items:center; gap:8px}
+.barraEd b::before{content:""; width:9px; height:9px; border-radius:50%;
+  background:var(--verde-txt); animation:latir 1.4s infinite}
+.barraEd button{background:rgba(0,36,26,.16); border:1px solid rgba(0,36,26,.3);
+  color:var(--verde-txt); font-family:var(--cuerpo); font-size:13.5px; font-weight:700;
+  padding:9px 15px; border-radius:9px; cursor:pointer}
+.barraEd button:hover{background:rgba(0,36,26,.28)}
+.barraEd .principal{background:var(--verde-txt); color:var(--verde); border-color:var(--verde-txt)}
+
+body.editando [data-edit]{
+  outline:1px dashed rgba(46,230,168,.55); outline-offset:4px;
+  border-radius:3px; cursor:text; transition:background .2s ease}
+body.editando [data-edit]:hover{background:rgba(46,230,168,.08)}
+body.editando [data-edit]:focus{outline:2px solid var(--verde); background:rgba(46,230,168,.1)}
+body.editando .col:hover,body.editando .res:hover{transform:none; box-shadow:none}
+body.editando .testimonio:hover{transform:none !important}
+
+.edTest{display:none; gap:8px; flex-wrap:wrap; align-items:center;
+  margin-top:12px; padding-top:12px; border-top:1px dashed rgba(46,230,168,.4)}
+body.editando .edTest{display:flex}
+.edTest button,.edTest label{background:rgba(46,230,168,.12); border:1px solid rgba(46,230,168,.4);
+  color:var(--verde); font-family:var(--cuerpo); font-size:12px; font-weight:600;
+  padding:7px 11px; border-radius:8px; cursor:pointer}
+.edTest button:hover,.edTest label:hover{background:rgba(46,230,168,.24)}
+.edTest .borrar{background:rgba(255,123,123,.12); border-color:rgba(255,123,123,.4); color:var(--rojo)}
+.edTest input[type=file]{display:none}
+.edAdd{display:none; margin-top:18px}
+body.editando .edAdd{display:block}
+.edAdd button{width:100%; background:rgba(46,230,168,.1);
+  border:1.5px dashed rgba(46,230,168,.5); color:var(--verde);
+  font-family:var(--cuerpo); font-size:15px; font-weight:700;
+  min-height:56px; border-radius:13px; cursor:pointer}
+.edAdd button:hover{background:rgba(46,230,168,.2)}
+
+/* ============================================================
+   12. APARICIONES
+   ============================================================ */
+.rev{opacity:0; transform:translateY(26px);
+  transition:opacity .8s cubic-bezier(.2,.7,.3,1), transform .8s cubic-bezier(.2,.7,.3,1)}
+.rev.visible{opacity:1; transform:none}
+.rev--izq{transform:translateX(-32px)}
+.rev--der{transform:translateX(32px)}
+.rev--esc{transform:scale(.95) translateY(18px)}
+.subrayado{position:relative; padding-bottom:15px}
+.subrayado::after{content:""; position:absolute; left:0; bottom:0; height:2px; width:0;
+  background:linear-gradient(90deg,var(--cielo),var(--aqua),transparent);
+  transition:width 1s cubic-bezier(.2,.7,.3,1) .15s}
+.subrayado.visible::after{width:120px}
+.cierre .subrayado::after{left:50%; transform:translateX(-50%)}
+.hero h1,.hero .video,.hero__cta{animation:entra .9s cubic-bezier(.2,.7,.3,1) backwards}
+.hero .video{animation-delay:.14s}
+.hero__cta{animation-delay:.26s}
+@keyframes entra{from{opacity:0; transform:translateY(24px)} to{opacity:1; transform:none}}
+
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none !important; transition-duration:.001ms !important}
+  .rev{opacity:1; transform:none}
+  .subrayado::after{width:120px}
+  .burbujas,.particulas{display:none}
+  .brillo{-webkit-text-fill-color:currentColor; background:none}
+  html{scroll-behavior:auto}
+}
+
+/* ============================================================
+   13. ESCRITORIO
+   ============================================================ */
+@media(min-width:700px){
+  :root{--aire:106px}
+  body{font-size:18px}
+  .env{padding-inline:40px}
+  .hero{padding-top:70px; padding-bottom:96px}
+  .hero h1{margin-bottom:32px}
+  .calc__panel{padding:36px 34px 40px}
+  .fase__cuerpo{grid-template-columns:1fr 1fr; gap:34px; align-items:center}
+  .rejilla-test{grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
+  .calc__cta{margin-inline:0}
+  .modal__cuerpo{padding:32px 40px 80px}
+  .modal__cab{padding:18px 40px}
+}
+@media(min-width:1000px){.hero h1{font-size:56px}}
+@media(max-width:400px){
+  .env{padding-inline:14px}
+  .filtro{gap:8px}
+  .mini b{font-size:19px}
+  .sonido{width:42px; height:42px}
+}
+</style>
+</head>
+
+<body id="artifacts-component-root-html">
+
+<div class="progreso" id="progreso" aria-hidden="true"></div>
+
+<!-- Barra del modo edición -->
+<div class="barraEd" id="barraEd">
+  <b>Modo edición activo</b>
+  <button type="button" id="edDescargar" class="principal">Descargar página actualizada</button>
+  <button type="button" id="edSalir">Salir del modo edición</button>
+</div>
+
+<!-- ============================================================
+     BLOQUE 1 — HERO
+     ============================================================ -->
+<header class="hero">
+  <div class="halo hero__halo-a"></div>
+  <div class="halo hero__halo-b"></div>
+  <div class="env">
+    <h1 data-edit="titular">El sistema de purificación de agua que usan más de 100 mil familias y celebridades para <em>liberarse del agua embotellada</em>, metales pesados y químicos, en menos de 24 horas</h1>
+
+    <div class="video" id="video">
+      <span class="video__play" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5-11-6.5z"></path></svg>
+      </span>
+      <p class="video__txt">Aquí va mi video</p>
+    </div>
+
+    <div class="hero__cta">
+      <a class="btn" href="#agenda" data-edit="cta1">Agenda tu videollamada gratis</a>
+    </div>
+  </div>
+</header>
+
+<!-- ============================================================
+     BLOQUE 2 — ¿ESTE SISTEMA ES PARA TI O NO?
+     ============================================================ -->
+<section class="franja-profunda filtro-sec" id="filtro">
+  <div class="burbujas" id="burbujas" aria-hidden="true"></div>
+  <div class="env">
+    <p class="cintillo rev"><span data-edit="cin1">antes de agendar</span></p>
+    <h2 class="t-seccion subrayado brillo rev" data-edit="tit1">¿Este sistema es para ti o no?</h2>
+
+    <div class="filtro">
+
+      <div class="col col--si rev rev--izq">
+        <h3>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M8 12.5l2.6 2.6L16 9.7"></path></svg>
+          <span data-edit="siTit">Esto sí es para ti si:</span>
+        </h3>
+        <ul>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+            <div><b data-edit="si1t">Buscas un hogar libre de plásticos</b>
+            <p data-edit="si1p">Quieres eliminar definitivamente el uso, el gasto y el desperdicio de botellas, jarras y garrafones de agua.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+            <div><b data-edit="si2t">Deseas cuidar tu cabello y tu piel</b>
+            <p data-edit="si2p">Estás harta de la resequedad y las irritaciones que te deja el cloro y la dureza del agua al bañarte.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+            <div><b data-edit="si3t">Tu prioridad es el bienestar de tu casa</b>
+            <p data-edit="si3p">Quieres reducir contaminantes como metales pesados, sedimentos y el cloro que llega al agua de tu hogar.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+            <div><b data-edit="si4t">Priorizas invertir en tu bienestar</b>
+            <p data-edit="si4p">Entiendes que tener agua purificada de alta calidad es una inversión a largo plazo para tu calidad de vida.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M4 12.5l5 5L20 6.5"></path></svg>
+            <div><b data-edit="si5t">Valoras el ahorro de dinero</b>
+            <p data-edit="si5p">Entiendes que un sistema en casa no es solo bienestar: también es una mejor forma de invertir tu plata.</p></div></li>
+        </ul>
+      </div>
+
+      <div class="col col--no rev rev--der">
+        <h3>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M9 9l6 6M15 9l-6 6"></path></svg>
+          <span data-edit="noTit">Esto no es para ti si:</span>
+        </h3>
+        <ul>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+            <div><b data-edit="no1t">Prefieres soluciones temporales</b>
+            <p data-edit="no1p">Buscas un filtro básico, desechable o de jarra en lugar de un sistema integral para todo el hogar.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+            <div><b data-edit="no2t">No tienes un hogar fijo</b>
+            <p data-edit="no2p">No planeas permanecer en tu vivienda actual, o no puedes hacer modificaciones en las instalaciones de agua.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+            <div><b data-edit="no3t">Buscas siempre lo más barato</b>
+            <p data-edit="no3p">No tienes el presupuesto ni el interés actual de adquirir un equipo residencial de alta gama.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+            <div><b data-edit="no4t">Te conformas con el agua de la llave</b>
+            <p data-edit="no4p">Consideras que la calidad del agua de tu red local es suficiente y no te interesa mejorarla.</p></div></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+            <div><b data-edit="no5t">Prefieres seguir gastando en botellas</b>
+            <p data-edit="no5p">Estás cómoda gastando cantidades absurdas de dinero cada mes en agua embotellada con microplásticos.</p></div></li>
+        </ul>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     BLOQUE 3 — TESTIMONIOS
+     ============================================================ -->
+<section id="testimonios">
+  <div class="env">
+    <p class="cintillo rev"><span data-edit="cin2">lo que dicen mis clientes</span></p>
+    <h2 class="t-seccion subrayado brillo rev" data-edit="tit2">Familias que ya decidieron cambiar su estilo de vida</h2>
+    <div class="rejilla-test" id="rejillaTest"></div>
+    <div class="edAdd"><button type="button" id="edAgregarTest">+ Agregar un testimonio</button></div>
+    <div class="ver-mas" id="verMas" hidden="">
+      <button type="button" id="btnVerMas">
+        <span id="txtVerMas">Ver todos los testimonios</span>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"></path></svg>
+      </button>
+    </div>
+  </div>
+</section>
+
+<div class="modal" id="modalTest" role="dialog" aria-modal="true" aria-label="Todos los testimonios">
+  <div class="modal__cab">
+    <h3 id="modalTitulo">Todos los testimonios</h3>
+    <button class="modal__cerrar" id="cerrarModal" aria-label="Cerrar">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+    </button>
+  </div>
+  <div class="modal__cuerpo"><div class="rejilla-test" id="rejillaModal"></div></div>
+</div>
+
+<!-- ============================================================
+     BLOQUE 4 — CALCULADORA
+     ============================================================ -->
+<section class="calc franja-profunda" id="calc">
+  <div class="halo calc__halo"></div>
+  <div class="particulas" id="particulas" aria-hidden="true"></div>
+  <div class="env">
+    <h2 class="t-seccion subrayado brillo rev" data-edit="tit3">Cuánto te cuesta comprar agua en botella en dinero y salud</h2>
+    <p class="calc__intro rev" data-edit="calcIntro">Responde unas preguntas y en segundos verás dos cosas: <strong>cuánto dinero se te va cada año</strong> en agua embotellada, y <strong>cuánto plástico está entrando a tu cuerpo</strong> con esas botellas, según los estudios científicos más recientes.</p>
+
+    <div class="calc__panel rev rev--esc">
+
+      <div class="fase fase--verde">
+        <div class="fase__cab">
+          <span class="fase__ico" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 1.5v21M17 5.8A4.2 4.2 0 0013 3.2h-2.2a3.6 3.6 0 000 7.2h2.4a3.6 3.6 0 010 7.2H11a4.2 4.2 0 01-4.2-2.6"></path></svg>
+          </span>
+          <div>
+            <p class="fase__tit" data-edit="fase1t">1 · Lo que gastas</p>
+            <p class="fase__exp" data-edit="fase1e">Dime qué compras, cuánto te cuesta y cuánto tomas. Te digo el total que se te va al año, y a dónde llegaría en 5 y en 10.</p>
+          </div>
+        </div>
+
+        <div class="fase__cuerpo">
+          <div>
+            <div class="campo">
+              <label for="formato">¿En qué formato compras el agua?</label>
+              <select id="formato">
+                <option value="paca" selected="">Paca de botellas</option>
+                <option value="botella">Botellas sueltas</option>
+                <option value="galon">Galones</option>
+              </select>
+            </div>
+            <div class="campo">
+              <label for="cantidad" id="lblCantidad">¿Cuántas pacas compras?</label>
+              <div class="campo__fila">
+                <input type="number" id="cantidad" min="0" step="1" value="4" inputmode="numeric">
+                <select id="periodo" aria-label="Cada cuánto compras">
+                  <option value="52">por semana</option>
+                  <option value="12" selected="">por mes</option>
+                </select>
+              </div>
+            </div>
+            <div class="campo">
+              <label for="precio" id="lblPrecio">¿Cuánto te cuesta cada paca?</label>
+              <input type="number" id="precio" min="0" step="0.5" value="7" inputmode="decimal">
+            </div>
+            <div class="campo" id="cajaContenido">
+              <label for="contenido" id="lblContenido">¿Cuántas botellas trae cada paca?</label>
+              <input type="number" id="contenido" min="1" step="1" value="24" inputmode="decimal">
+            </div>
+            <div class="campo">
+              <label for="consumo" id="lblConsumo">¿Cuántas botellas tomas al día?</label>
+              <input type="number" id="consumo" min="0" step="1" value="4" inputmode="decimal">
+            </div>
+          </div>
+
+          <div class="res res--verde" id="resDinero">
+            <p class="res__eti" data-edit="resEti1">Lo que gastas al año</p>
+            <span class="res__num" id="rDinero">$336</span>
+            <p class="res__sub" id="rBase">calculado sobre lo que compras</p>
+            <div class="mini">
+              <div><b id="rCinco">$1,680</b><span>en 5 años</span></div>
+              <div><b id="rDiez">$3,360</b><span>en 10 años</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="fase">
+        <div class="fase__cab">
+          <span class="fase__ico" aria-hidden="true">
+            <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <circle cx="12" cy="12" r="2.3" fill="currentColor" stroke="none"></circle>
+              <ellipse cx="12" cy="12" rx="10" ry="4.4"></ellipse>
+              <ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(60 12 12)"></ellipse>
+              <ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(120 12 12)"></ellipse>
+            </svg>
+          </span>
+          <div>
+            <p class="fase__tit" data-edit="fase2t">2 · Lo que tomas</p>
+            <p class="fase__exp" data-edit="fase2e">Con lo que tomas al día calculo cuántas partículas de plástico entran a tu cuerpo en un año sin que te des cuenta.</p>
+          </div>
+        </div>
+
+        <div class="fase__cuerpo">
+          <div>
+            <div class="campo" id="cajaMl">
+              <label for="ml">¿De cuántos mililitros es cada botella?</label>
+              <input type="number" id="ml" min="50" step="50" value="500" inputmode="numeric">
+            </div>
+            <p class="fase__exp" id="notaFase2" style="margin-top:14px">Usamos las botellas al día que pusiste arriba para sacar cuántos litros embotellados te tomas en un año.</p>
+          </div>
+
+          <div class="res res--azul" id="resPlastico">
+            <p class="res__eti" data-edit="resEti2">Partículas de plástico al año</p>
+            <span class="res__num" id="rPlastico">175 millones</span>
+            <p class="res__sub" id="rLitros">a razón de 730 litros embotellados al año</p>
+            <p class="tarj-eti" data-edit="tarjEti">Plástico que procesa tu cuerpo, en equivalente a tarjetas de crédito:</p>
+            <div class="mini">
+              <div><b id="rTarjetas">52</b><span>tarjetas de crédito al año*</span></div>
+              <div><b id="rGramos">260 g</b><span>de plástico al año*</span></div>
+            </div>
+            <div class="tarjetas" id="visualTarjetas" aria-hidden="true"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="fuente">
+        <h4 data-edit="fuenteTit">De dónde salen estos números</h4>
+        <p data-edit="fuente1">Las universidades de <strong>Columbia y Rutgers</strong> midieron el agua embotellada con un microscopio nuevo y encontraron unas <strong>240.000 partículas de plástico por litro</strong>. Nueve de cada diez son tan diminutas que cruzan del intestino a la sangre, y ya se han encontrado en órganos. El cuerpo no tiene forma clara de sacarlas, así que la preocupación es que se vayan acumulando.</p>
+        <p data-edit="fuente2">Nadie puede decirte qué te va a pasar a ti: esto varía mucho de una persona a otra. Lo único seguro es que cada botella trae plástico. <a href="https://www.publichealth.columbia.edu/news/bottled-water-can-contain-hundreds-thousands-nanoplastics" target="_blank" rel="noopener">Lee el estudio original aquí</a>.</p>
+        <p style="font-size:12.5px" data-edit="fuente3">*Las tarjetas y los gramos salen de otro estudio: el de la <strong>Universidad de Newcastle</strong> para WWF, que calcula unos 5 gramos de plástico por semana por persona, de todas las fuentes juntas. Es un promedio, no un número sacado de tus botellas.</p>
+      </div>
+
+      <div class="calc__cta">
+        <a class="btn" href="#agenda" data-edit="cta2">Agenda tu videollamada gratis</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================
+     BLOQUE 5 — CIERRE
+     ============================================================ -->
+<section class="cierre" id="agenda">
+  <div class="halo cierre__halo"></div>
+  <div class="env">
+    <p class="cintillo rev"><span data-edit="cin3">último paso</span></p>
+    <h2 class="subrayado rev" data-edit="tit4">Agenda tu <em>videollamada</em></h2>
+    <p class="cierre__linea rev" data-edit="cierreLinea">Solo tomo un número limitado de llamadas por mes. Agenda ahora antes de que se acaben los cupos.</p>
+    <div class="calendly rev rev--esc" id="calendly" hidden=""></div>
+  </div>
+</section>
+
+<!-- ============================================================
+     AGENTE FLOTANTE
+     ============================================================ -->
+<div class="agente" id="agente">
+  <div class="agente__globo" id="globoAgente">¿Tienes dudas? <b>Pregúntale a nuestro agente</b></div>
+  <button class="agente__btn" id="btnAgente" aria-label="Abrir el asistente" aria-expanded="false">
+    <svg class="robot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <g class="cuerpo">
+        <g class="antena"><path d="M12 3.6V6"></path><circle cx="12" cy="2.9" r="1.05" fill="currentColor" stroke="none"></circle></g>
+        <rect x="4.6" y="6.2" width="14.8" height="11" rx="3.4"></rect>
+        <g class="ojos"><circle cx="9.3" cy="11.2" r="1.45" fill="currentColor" stroke="none"></circle><circle cx="14.7" cy="11.2" r="1.45" fill="currentColor" stroke="none"></circle></g>
+        <path d="M9.6 14.4h4.8"></path><path d="M2.6 10.2v3M21.4 10.2v3"></path>
+      </g>
+      <path class="pataI" d="M9.5 17.2v3.4"></path>
+      <path class="pataD" d="M14.5 17.2v3.4"></path>
+    </svg>
+  </button>
+</div>
+
+<div class="chat" id="chat" role="dialog" aria-label="Asistente de IA">
+  <div class="chat__cab">
+    <span class="chat__ico" aria-hidden="true">
+      <svg class="robot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <g class="cuerpo">
+          <g class="antena"><path d="M12 3.6V6"></path><circle cx="12" cy="2.9" r="1.05" fill="currentColor" stroke="none"></circle></g>
+          <rect x="4.6" y="6.2" width="14.8" height="11" rx="3.4"></rect>
+          <g class="ojos"><circle cx="9.3" cy="11.2" r="1.45" fill="currentColor" stroke="none"></circle><circle cx="14.7" cy="11.2" r="1.45" fill="currentColor" stroke="none"></circle></g>
+          <path d="M9.6 14.4h4.8"></path><path d="M2.6 10.2v3M21.4 10.2v3"></path>
+        </g>
+        <path class="pataI" d="M9.5 17.2v3.4"></path>
+        <path class="pataD" d="M14.5 17.2v3.4"></path>
+      </svg>
+    </span>
+    <div><b id="chatNombre">Asistente de IA</b><span>en línea</span></div>
+    <button class="chat__cerrar" id="cerrarChat" aria-label="Cerrar el asistente">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+    </button>
+  </div>
+
+  <div class="chat__cuerpo" id="chatCuerpo"></div>
+  <div class="chat__opciones" id="chatOpciones"></div>
+
+  <!-- PANEL DE CREADORES -->
+  <div class="creador" id="creador">
+    <div class="creador__cab">
+      <button class="creador__volver" id="creadorVolver" aria-label="Volver al chat">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"></path></svg>
+      </button>
+      <b id="creadorTitulo">Para creadores</b>
+    </div>
+
+    <div class="creador__cuerpo">
+      <div id="creadorLlave">
+        <h4>Acceso restringido</h4>
+        <p class="pista">Esta zona es solo para el administrador de la página.</p>
+        <div class="campo">
+          <label for="creadorClave">Contraseña</label>
+          <input type="password" id="creadorClave" autocomplete="off" placeholder="••••••••">
+        </div>
+        <p class="creador__err" id="creadorErr"></p>
+        <div class="creador__acciones">
+          <button class="btn" type="button" id="creadorEntrar">Entrar</button>
+        </div>
+      </div>
+
+      <div id="creadorPanel" hidden="">
+
+        <h4>Editar la página</h4>
+        <p class="pista">Al activarlo, el chat se cierra y todos los textos, fotos y estrellas de la página se pueden tocar y cambiar.</p>
+        <div class="creador__acciones">
+          <button class="btn" type="button" id="creadorEditar">Activar modo edición</button>
+        </div>
+
+        <h4>Enlaces</h4>
+        <div class="campo">
+          <label for="cCalendly">Enlace de Calendly</label>
+          <input type="text" id="cCalendly" placeholder="https://calendly.com/tunombre/20min" autocomplete="off">
+        </div>
+        <div class="campo">
+          <label for="cVideo">Enlace de tu video (VSL)</label>
+          <input type="text" id="cVideo" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off">
+        </div>
+
+        <h4>Música de fondo</h4>
+        <p class="pista">El archivo debe estar subido junto a la página. Consíguela gratis en pixabay.com/music.</p>
+        <div class="campo">
+          <label for="cMusica">Archivo de música</label>
+          <input type="text" id="cMusica" placeholder="musica.mp3" autocomplete="off">
+        </div>
+        <div class="campo">
+          <label for="cVolumen">Volumen: <span id="cVolTxt">25%</span></label>
+          <input type="range" id="cVolumen" min="0" max="100" step="5" value="25" style="padding:0;min-height:auto">
+        </div>
+        <div class="creador__acciones">
+          <button class="creador__sec" type="button" id="cProbar">Probar la música</button>
+        </div>
+
+        <h4>El asistente</h4>
+        <div class="campo">
+          <label for="cAgNombre">Nombre del asistente</label>
+          <input type="text" id="cAgNombre" autocomplete="off">
+        </div>
+        <div class="campo">
+          <label for="cAgSaludo">Saludo</label>
+          <textarea id="cAgSaludo"></textarea>
+        </div>
+        <div class="campo">
+          <label for="cAgComoP">Pregunta del botón verde</label>
+          <input type="text" id="cAgComoP" autocomplete="off">
+        </div>
+        <div class="campo">
+          <label for="cAgComoR">Respuesta: cómo agendar</label>
+          <textarea id="cAgComoR" style="min-height:120px"></textarea>
+        </div>
+
+        <h4>Preguntas y respuestas</h4>
+        <div id="cListaQA"></div>
+        <div class="creador__acciones">
+          <button class="creador__sec" type="button" id="cAgregarQA">+ Agregar pregunta</button>
+        </div>
+
+        <h4>Guardar</h4>
+        <div class="creador__aviso">
+          Lo que cambies vive solo en este dispositivo. Para que tus visitantes lo vean: descarga la página actualizada y súbela a Netlify.
+        </div>
+        <div class="creador__acciones">
+          <button class="btn" type="button" id="cDescargar">Descargar página actualizada</button>
+          <button class="creador__sec creador__sec--rojo" type="button" id="cDesconectar">Desconectar</button>
+        </div>
+        <p class="creador__ok" id="creadorOk"></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<button class="sonido" id="btnSonido" aria-label="Silenciar o activar la música">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11 5L6.5 9H3v6h3.5L11 19V5z" fill="currentColor"></path>
+    <g class="ondas"><path d="M15.5 8.8a4.5 4.5 0 010 6.4"></path><path d="M18.3 6a8.5 8.5 0 010 12"></path></g>
+    <path class="tachado" d="M16 9.5l5 5M21 9.5l-5 5"></path>
+  </svg>
+</button>
+
+<!-- ════════════════════════════════════════════════════════════
+     TODOS TUS DATOS VIVEN AQUÍ.
+     Puedes cambiarlos a mano, o mucho más fácil desde el panel
+     "Para creadores" que está dentro del chat del asistente.
+     ════════════════════════════════════════════════════════════ -->
+<script id="datos" type="application/json">
+{
+  "calendlyUrl": "",
+  "videoUrl": "",
+  "musicaUrl": "",
+  "musicaVolumen": 0.25,
+  "huellaClave": "6e70e0f61fea4453",
+  "testimoniosVisibles": 5,
+  "textos": {
+    "titular": "El sistema de purificación de agua que usan más de 100 mil familias y celebridades para <em>liberarse del agua embotellada</em>, metales pesados y químicos, en menos de 24 horas",
+    "cta1": "Agenda tu videollamada gratis",
+    "cin1": "antes de agendar",
+    "tit1": "¿Este sistema es para ti o no?",
+    "siTit": "Esto sí es para ti si:",
+    "si1t": "Buscas un hogar libre de plásticos",
+    "si1p": "Quieres eliminar definitivamente el uso, el gasto y el desperdicio de botellas, jarras y garrafones de agua.",
+    "si2t": "Deseas cuidar tu cabello y tu piel",
+    "si2p": "Estás harta de la resequedad y las irritaciones que te deja el cloro y la dureza del agua al bañarte.",
+    "si3t": "Tu prioridad es el bienestar de tu casa",
+    "si3p": "Quieres reducir contaminantes como metales pesados, sedimentos y el cloro que llega al agua de tu hogar.",
+    "si4t": "Priorizas invertir en tu bienestar",
+    "si4p": "Entiendes que tener agua purificada de alta calidad es una inversión a largo plazo para tu calidad de vida.",
+    "si5t": "Valoras el ahorro de dinero",
+    "si5p": "Entiendes que un sistema en casa no es solo bienestar: también es una mejor forma de invertir tu plata.",
+    "noTit": "Esto no es para ti si:",
+    "no1t": "Prefieres soluciones temporales",
+    "no1p": "Buscas un filtro básico, desechable o de jarra en lugar de un sistema integral para todo el hogar.",
+    "no2t": "No tienes un hogar fijo",
+    "no2p": "No planeas permanecer en tu vivienda actual, o no puedes hacer modificaciones en las instalaciones de agua.",
+    "no3t": "Buscas siempre lo más barato",
+    "no3p": "No tienes el presupuesto ni el interés actual de adquirir un equipo residencial de alta gama.",
+    "no4t": "Te conformas con el agua de la llave",
+    "no4p": "Consideras que la calidad del agua de tu red local es suficiente y no te interesa mejorarla.",
+    "no5t": "Prefieres seguir gastando en botellas",
+    "no5p": "Estás cómoda gastando cantidades absurdas de dinero cada mes en agua embotellada con microplásticos.",
+    "cin2": "lo que dicen mis clientes",
+    "tit2": "Familias que ya decidieron cambiar su estilo de vida",
+    "tit3": "Cuánto te cuesta comprar agua en botella en dinero y salud",
+    "calcIntro": "Responde unas preguntas y en segundos verás dos cosas: <strong>cuánto dinero se te va cada año</strong> en agua embotellada, y <strong>cuánto plástico está entrando a tu cuerpo</strong> con esas botellas, según los estudios científicos más recientes.",
+    "fase1t": "1 · Lo que gastas",
+    "fase1e": "Dime qué compras, cuánto te cuesta y cuánto tomas. Te digo el total que se te va al año, y a dónde llegaría en 5 y en 10.",
+    "resEti1": "Lo que gastas al año",
+    "fase2t": "2 · Lo que tomas",
+    "fase2e": "Con lo que tomas al día calculo cuántas partículas de plástico entran a tu cuerpo en un año sin que te des cuenta.",
+    "resEti2": "Partículas de plástico al año",
+    "tarjEti": "Plástico que procesa tu cuerpo, en equivalente a tarjetas de crédito:",
+    "fuenteTit": "De dónde salen estos números",
+    "fuente1": "Las universidades de <strong>Columbia y Rutgers</strong> midieron el agua embotellada con un microscopio nuevo y encontraron unas <strong>240.000 partículas de plástico por litro</strong>. Nueve de cada diez son tan diminutas que cruzan del intestino a la sangre, y ya se han encontrado en órganos. El cuerpo no tiene forma clara de sacarlas, así que la preocupación es que se vayan acumulando.",
+    "fuente2": "Nadie puede decirte qué te va a pasar a ti: esto varía mucho de una persona a otra. Lo único seguro es que cada botella trae plástico. <a href=\"https://www.publichealth.columbia.edu/news/bottled-water-can-contain-hundreds-thousands-nanoplastics\" target=\"_blank\" rel=\"noopener\">Lee el estudio original aquí</a>.",
+    "fuente3": "*Las tarjetas y los gramos salen de otro estudio: el de la <strong>Universidad de Newcastle</strong> para WWF, que calcula unos 5 gramos de plástico por semana por persona, de todas las fuentes juntas. Es un promedio, no un número sacado de tus botellas.",
+    "cta2": "Agenda tu videollamada gratis",
+    "cin3": "último paso",
+    "tit4": "Agenda tu <em>videollamada</em>",
+    "cierreLinea": "Solo tomo un número limitado de llamadas por mes. Agenda ahora antes de que se acaben los cupos."
+  },
+  "testimonios": [
+    {
+      "texto": "[PROVISIONAL] Llevábamos años cargando botellones desde el súper cada domingo. Eso se acabó. Ahora abro la llave de la cocina y ya.",
+      "nombre": "[Nombre del cliente]",
+      "ciudad": "[Ciudad, estado]",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "[PROVISIONAL] Nunca había sumado lo que gastábamos al mes en agua. Cuando lo vi en la llamada entendí por qué valía la pena.",
+      "nombre": "[Nombre del cliente]",
+      "ciudad": "[Ciudad, estado]",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "[PROVISIONAL] Los niños llenan su botella antes de la escuela y yo estoy tranquila con lo que están tomando.",
+      "nombre": "[Nombre del cliente]",
+      "ciudad": "[Ciudad, estado]",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "[PROVISIONAL] Lo primero que noté fue en la ducha. El cabello se siente distinto y uso menos acondicionador que antes.",
+      "nombre": "[Nombre del cliente]",
+      "ciudad": "[Ciudad, estado]",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "[PROVISIONAL] Todo por Zoom, en veinte minutos, sin que nadie viniera a mi casa a insistirme. Mucho más fácil de lo que pensé.",
+      "nombre": "[Nombre del cliente]",
+      "ciudad": "[Ciudad, estado]",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "[PROVISIONAL] Me dijo desde el principio que si no me convenía, no pasaba nada. Nunca sentí que me estuvieran empujando a firmar.",
+      "nombre": "[Nombre del cliente]",
+      "ciudad": "[Ciudad, estado]",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "Escribe aquí lo que dijo tu cliente.",
+      "nombre": "Nombre",
+      "ciudad": "Ciudad, estado",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "Escribe aquí lo que dijo tu cliente.",
+      "nombre": "Nombre",
+      "ciudad": "Ciudad, estado",
+      "foto": "",
+      "estrellas": 5
+    },
+    {
+      "texto": "Escribe aquí lo que dijo tu cliente.",
+      "nombre": "Nombre",
+      "ciudad": "Ciudad, estado",
+      "foto": "",
+      "estrellas": 5
+    }
+  ],
+  "agente": {
+    "nombre": "Asistente de IA",
+    "saludo": "Hola. Soy el asistente. Toca una pregunta y te respondo al instante.",
+    "textoCta": "Agenda tu videollamada gratis",
+    "preguntas": [
+      {
+        "pregunta": "¿Cuánto cuesta un sistema?",
+        "respuesta": "Depende del tamaño de tu casa y de lo que salga en tu reporte de agua. Por eso hacemos la llamada antes de hablar de precios. Los sistemas residenciales en Estados Unidos van desde cientos hasta varios miles de dólares, y hay opciones de financiamiento."
+      },
+      {
+        "pregunta": "¿Tengo que comprar algo?",
+        "respuesta": "No. La llamada es de diagnóstico. Compras solo si tú decides que tiene sentido."
+      },
+      {
+        "pregunta": "¿Vas a venir a mi casa?",
+        "respuesta": "No. Todo es por videollamada, desde donde estés."
+      },
+      {
+        "pregunta": "¿Y si alquilo, no soy dueño?",
+        "respuesta": "Dilo en la llamada. Hay opciones que no requieren instalación permanente."
+      },
+      {
+        "pregunta": "¿De dónde sale la información del agua de mi zona?",
+        "respuesta": "De reportes públicos y oficiales. Cada sistema de agua está obligado a publicar cada año qué contiene el agua que entrega. En la llamada te ayudamos a leerlo."
+      },
+      {
+        "pregunta": "¿Cuánto dura la llamada?",
+        "respuesta": "Veinte minutos por Zoom. Ni uno más si no quieres."
+      }
+    ],
+    "comoAgendar": {
+      "pregunta": "¿Cómo agendo mi videollamada?",
+      "respuesta": "[EDITA ESTE TEXTO] Aquí explica el paso a paso: dónde toca el botón, qué día y hora puede elegir, qué le llega por correo, y qué pasa si tiene que cancelar."
+    }
+  }
+}
+</script>
+
+<script>
+/* ════════════════════════════════════════════════════════════
+   MOTOR DE LA PÁGINA
+   ════════════════════════════════════════════════════════════ */
+
+/* Guardamos el archivo original tal cual llegó, antes de que el
+   código toque nada. Es lo que se usa para descargar la página
+   actualizada más adelante. */
+const FUENTE = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+
+const $ = id => document.getElementById(id);
+const menosMov = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const vacio = v => !v || String(v).trim() === "";
+
+const D = JSON.parse($("datos").textContent);
+
+function huella(s) {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = (h1 ^ c) >>> 0; h1 = Math.imul(h1, 16777619) >>> 0;
+    h2 = (h2 + c * (i + 7)) >>> 0; h2 = Math.imul(h2, 2246822519) >>> 0;
+  }
+  return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+
+/* Aplica los textos que hayas editado antes */
+Object.keys(D.textos || {}).forEach(k => {
+  const el = document.querySelector('[data-edit="' + k + '"]');
+  if (el) el.innerHTML = D.textos[k];
+});
+
+/* ---------- Barra de progreso ---------- */
+(function () {
+  const barra = $("progreso");
+  let pend = false;
+  const pintar = () => {
+    const alto = document.documentElement.scrollHeight - window.innerHeight;
+    barra.style.width = (alto > 0 ? (window.scrollY / alto) * 100 : 0) + "%";
+    pend = false;
+  };
+  window.addEventListener("scroll", () => { if (!pend) { pend = true; requestAnimationFrame(pintar); } }, { passive:true });
+  pintar();
+})();
+
+/* ---------- Onda al tocar los botones ---------- */
+document.addEventListener("click", e => {
+  const b = e.target.closest(".btn");
+  if (!b || menosMov || document.body.classList.contains("editando")) return;
+  const r = b.getBoundingClientRect();
+  const o = document.createElement("span");
+  o.className = "onda";
+  o.style.width = o.style.height = Math.max(r.width, r.height) + "px";
+  o.style.left = (e.clientX - r.left) + "px";
+  o.style.top  = (e.clientY - r.top) + "px";
+  b.appendChild(o);
+  setTimeout(() => o.remove(), 620);
+});
+
+/* ════════════════════════════════════════════════════════════
+   MÚSICA DE FONDO
+   Arranca con la primera señal de la persona (deslizar, tocar,
+   mover el mouse). Los navegadores no permiten sonido antes.
+   Se apaga cuando arranca el VSL y vuelve cuando termina.
+   ════════════════════════════════════════════════════════════ */
+const Musica = (function () {
+  let audio = null, activa = false, mudo = false, pausada = false;
+  let VOL = Math.max(0, Math.min(1, D.musicaVolumen || .25));
+
+  function crear(url) {
+    if (audio) { audio.pause(); audio = null; }
+    audio = new Audio(url);
+    audio.loop = true; audio.volume = 0; audio.preload = "auto";
+  }
+  function fundir(hacia, ms, fin) {
+    if (!audio) return;
+    const desde = audio.volume, ini = performance.now();
+    (function paso(t0) {
+      const t = Math.min((t0 - ini) / ms, 1);
+      audio.volume = Math.max(0, Math.min(1, desde + (hacia - desde) * t));
+      if (t < 1) requestAnimationFrame(paso); else if (fin) fin();
+    })(performance.now());
+  }
+  function arrancar() {
+    if (!audio || activa) return;
+    audio.play().then(() => {
+      activa = true;
+      $("btnSonido").classList.add("activo");
+      if (!mudo) fundir(VOL, 2000);
+    }).catch(() => {});
+  }
+  return {
+    iniciar() {
+      if (vacio(D.musicaUrl)) return;
+      crear(D.musicaUrl.trim());
+      audio.play().catch(() => {});
+      const señales = ["touchstart","touchmove","pointerdown","mousemove","wheel","scroll","keydown","click"];
+      const gesto = () => { arrancar(); if (activa) señales.forEach(s => window.removeEventListener(s, gesto)); };
+      señales.forEach(s => window.addEventListener(s, gesto, { passive:true }));
+    },
+    alternarMudo() {
+      if (!audio) return;
+      mudo = !mudo;
+      $("btnSonido").classList.toggle("mudo", mudo);
+      fundir(mudo ? 0 : VOL, 500);
+    },
+    bajarPorVideo() {
+      if (!audio || !activa || mudo) return;
+      pausada = true;
+      fundir(0, 800, () => { if (pausada) audio.pause(); });
+    },
+    subirPorVideo() {
+      if (!audio || !pausada || mudo) return;
+      pausada = false;
+      audio.play().then(() => fundir(VOL, 1400)).catch(() => {});
+    },
+    probar(url, vol) {
+      VOL = vol; crear(url);
+      audio.play().then(() => {
+        activa = true; mudo = false;
+        $("btnSonido").classList.add("activo");
+        $("btnSonido").classList.remove("mudo");
+        fundir(vol, 900);
+      }).catch(() => {});
+    }
+  };
+})();
+Musica.iniciar();
+$("btnSonido").addEventListener("click", () => Musica.alternarMudo());
+
+/* ---------- VSL del hero ---------- */
+function montarVideo() {
+  if (vacio(D.videoUrl)) return;
+  const u = D.videoUrl.trim();
+  const yt = u.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([\w-]{6,})/);
+  const vm = u.match(/vimeo\.com\/(\d+)/);
+  if (yt) {
+    $("video").innerHTML = '<div id="ytPlayer"></div>';
+    const s = document.createElement("script");
+    s.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(s);
+    window.onYouTubeIframeAPIReady = function () {
+      new YT.Player("ytPlayer", {
+        videoId: yt[1],
+        playerVars: { rel:0, modestbranding:1, playsinline:1 },
+        events: { onStateChange: e => {
+          if (e.data === YT.PlayerState.PLAYING) Musica.bajarPorVideo();
+          if (e.data === YT.PlayerState.ENDED || e.data === YT.PlayerState.PAUSED) Musica.subirPorVideo();
+        }}
+      });
+    };
+  } else {
+    const embed = vm ? "https://player.vimeo.com/video/" + vm[1] : u;
+    $("video").innerHTML = '<iframe src="' + embed + '" title="Video de presentación" ' +
+      'allow="accelerometer; clipboard-write; encrypted-media; picture-in-picture" allowfullscreen loading="lazy"></iframe>';
+  }
+}
+montarVideo();
+
+/* ---------- Calendly ---------- */
+function montarCalendly() {
+  if (vacio(D.calendlyUrl)) return;
+  const sep = D.calendlyUrl.includes("?") ? "&" : "?";
+  const src = D.calendlyUrl.trim() + sep +
+    "hide_gdpr_banner=1&background_color=04121F&text_color=F3F8FB&primary_color=2EE6A8";
+  const caja = $("calendly");
+  caja.hidden = false;
+  caja.innerHTML = '<iframe src="' + src + '" title="Calendario para agendar la videollamada" ' +
+    'style="width:100%;height:680px;border:0" loading="lazy"></iframe>';
+}
+montarCalendly();
+
+/* ---------- Burbujas y partículas ---------- */
+(function () {
+  if (menosMov) return;
+  let b = "";
+  for (let i = 0; i < (innerWidth < 700 ? 12 : 20); i++) {
+    const t = 8 + Math.random() * 26;
+    b += '<span class="burbuja" style="width:' + t + 'px;height:' + t + 'px;left:' + (Math.random()*100) +
+         '%;animation-duration:' + (11 + Math.random()*14) + 's;animation-delay:-' + (Math.random()*16) +
+         's;--dx:' + (Math.random()*70-35).toFixed(0) + 'px"></span>';
+  }
+  $("burbujas").innerHTML = b;
+  let p = "";
+  for (let i = 0; i < (innerWidth < 700 ? 16 : 30); i++) {
+    const t = 1.5 + Math.random() * 3;
+    p += '<span class="particula" style="width:' + t + 'px;height:' + t + 'px;left:' + (Math.random()*100) +
+         '%;top:' + (Math.random()*100) + '%;animation-duration:' + (14 + Math.random()*16) +
+         's;animation-delay:-' + (Math.random()*20) + 's;--px:' + (Math.random()*160-80).toFixed(0) +
+         'px;--py:' + (-60 - Math.random()*140).toFixed(0) + 'px"></span>';
+  }
+  $("particulas").innerHTML = p;
+})();
+
+/* ════════════════════════════════════════════════════════════
+   CALCULADORA
+   DINERO: se queda con el mayor entre lo que dice comprar y lo
+   que dice tomar, porque casi siempre uno de los dos se queda corto.
+   PLÁSTICO: litros al año × 240.000 partículas por litro
+   (estudio PNAS 2024, Columbia y Rutgers).
+   ⚠️ Las tarjetas NO salen de esas partículas: vienen de otro
+   estudio (WWF y Newcastle, 5 g por semana). Por eso son fijas.
+   ════════════════════════════════════════════════════════════ */
+(function () {
+  const POR_LITRO = 240000, TARJETAS = 52, GRAMOS_SEM = 5;
+  const F = {
+    paca:    { cant:"¿Cuántas pacas compras?", prec:"¿Cuánto te cuesta cada paca?",
+               cont:"¿Cuántas botellas trae cada paca?", contDef:24,
+               cons:"¿Cuántas botellas tomas al día?", consDef:4,
+               porBotella:true, mlDef:500, cantDef:4, precDef:7 },
+    botella: { cant:"¿Cuántas botellas compras?", prec:"¿Cuánto te cuesta cada botella?",
+               cont:null, contDef:1,
+               cons:"¿Cuántas botellas tomas al día?", consDef:4,
+               porBotella:true, mlDef:500, cantDef:24, precDef:1 },
+    galon:   { cant:"¿Cuántos galones compras?", prec:"¿Cuánto te cuesta cada galón?",
+               cont:"¿Cuántos litros trae cada galón?", contDef:3.8,
+               cons:"¿Cuántos litros de agua tomas al día?", consDef:2,
+               porBotella:false, cantDef:8, precDef:2 }
+  };
+  const dolar = new Intl.NumberFormat("es-US", { style:"currency", currency:"USD", maximumFractionDigits:0 });
+  const num = new Intl.NumberFormat("es-ES");
+
+  function enPalabras(n) {
+    if (n < 1000) return num.format(n);
+    const c = v => num.format(Math.round(v * 10) / 10);
+    if (n < 1e6) return c(n / 1e3) + " mil";
+    if (n < 1e9) return c(n / 1e6) + (Math.round(n / 1e6) === 1 ? " millón" : " millones");
+    return c(n / 1e9) + " mil millones";
+  }
+
+  let anim = null, mostrado = 0;
+  function contar(el, dest) {
+    if (anim) cancelAnimationFrame(anim);
+    if (menosMov) { el.textContent = dolar.format(dest); mostrado = dest; return; }
+    const desde = mostrado, ini = performance.now();
+    (function paso(t0){
+      const t = Math.min((t0 - ini) / 420, 1);
+      const s = 1 - Math.pow(1 - t, 3);
+      el.textContent = dolar.format(Math.round(desde + (dest - desde) * s));
+      if (t < 1) anim = requestAnimationFrame(paso); else mostrado = dest;
+    })(performance.now());
+  }
+
+  function aplicar(reset) {
+    const f = F[$("formato").value];
+    $("lblCantidad").textContent = f.cant;
+    $("lblPrecio").textContent = f.prec;
+    $("lblConsumo").textContent = f.cons;
+    if (f.cont) {
+      $("cajaContenido").hidden = false;
+      $("lblContenido").textContent = f.cont;
+      if (reset) $("contenido").value = f.contDef;
+    } else { $("cajaContenido").hidden = true; $("contenido").value = 1; }
+    $("cajaMl").hidden = !f.porBotella;
+    $("notaFase2").textContent = f.porBotella
+      ? "Usamos las botellas al día que pusiste arriba para sacar cuántos litros embotellados te tomas en un año."
+      : "Usamos los litros al día que pusiste arriba para sacar cuánto plástico entra a tu cuerpo en un año.";
+    if (reset) {
+      $("cantidad").value = f.cantDef; $("precio").value = f.precDef;
+      $("consumo").value = f.consDef; $("consumo").step = f.porBotella ? "1" : "0.5";
+      if (f.porBotella) $("ml").value = f.mlDef;
+    }
+  }
+
+  function actualizar() {
+    const f = F[$("formato").value];
+    const cant = Math.max(0, +$("cantidad").value || 0);
+    const vec  = +$("periodo").value;
+    const prec = Math.max(0, +$("precio").value || 0);
+    const cont = Math.max(1, +$("contenido").value || 1);
+    const cons = Math.max(0, +$("consumo").value || 0);
+    const ml   = Math.max(0, +$("ml").value || 0);
+
+    const gastoCompra  = cant * prec * vec;
+    const gastoConsumo = (cons * 365) * (prec / cont);
+    const alAño = Math.max(gastoCompra, gastoConsumo);
+
+    contar($("rDinero"), alAño);
+    $("rCinco").textContent = dolar.format(alAño * 5);
+    $("rDiez").textContent = dolar.format(alAño * 10);
+    $("rBase").textContent = gastoConsumo > gastoCompra
+      ? "calculado sobre lo que tomas, que es más de lo que compras"
+      : "calculado sobre lo que compras";
+
+    const litrosAño = (f.porBotella ? (ml / 1000) * cons : cons) * 365;
+    $("rPlastico").textContent = enPalabras(Math.round(litrosAño * POR_LITRO));
+    $("rLitros").textContent = "a razón de " + num.format(Math.round(litrosAño)) + " litros embotellados al año";
+    $("rTarjetas").textContent = TARJETAS;
+    $("rGramos").textContent = num.format(GRAMOS_SEM * 52) + " g";
+  }
+
+  $("formato").addEventListener("change", () => { aplicar(true); actualizar(); });
+  ["cantidad","periodo","precio","contenido","consumo","ml"].forEach(id => {
+    $(id).addEventListener("input", actualizar);
+    $(id).addEventListener("change", actualizar);
+  });
+  aplicar(false); actualizar();
+
+  let h = "";
+  for (let i = 0; i < TARJETAS; i++) h += '<i class="tarjeta" style="animation-delay:' + (i*14) + 'ms"></i>';
+  $("visualTarjetas").innerHTML = h;
+})();
+
+["resDinero","resPlastico"].forEach(id => {
+  $(id).addEventListener("touchstart", () => {
+    ["resDinero","resPlastico"].forEach(o => $(o).classList.remove("tocada"));
+    $(id).classList.add("tocada");
+  }, { passive:true });
+});
+
+/* ════════════════════════════════════════════════════════════
+   TESTIMONIOS
+   ════════════════════════════════════════════════════════════ */
+const ESTRELLA = '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3 6.6 7 .8-5.2 4.8 1.4 7L12 17.8 5.8 21.2l1.4-7L2 9.4l7-.8L12 2z"/></svg>';
+const escapar = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+function tarjetaTest(t, i) {
+  const n = Math.max(1, Math.min(5, t.estrellas || 5));
+  const ini = (t.nombre || "?").replace(/[^A-Za-zÁÉÍÓÚÑáéíóúñ]/g,"").charAt(0).toUpperCase() || "?";
+  const foto = t.foto && t.foto.trim()
+    ? '<img class="test__foto" src="' + escapar(t.foto) + '" alt="Foto de ' + escapar(t.nombre) + '" loading="lazy">'
+    : '<span class="test__foto" aria-hidden="true">' + ini + '</span>';
+
+  let estrellas = "";
+  for (let e = 1; e <= 5; e++) {
+    estrellas += '<button type="button" data-estrella="' + e + '" data-i="' + i + '" tabindex="-1" ' +
+      'style="opacity:' + (e <= n ? 1 : .22) + '">' + ESTRELLA + '</button>';
+  }
+
+  return '<article class="testimonio" data-i="' + i + '" style="animation-delay:' + (i*55) + 'ms">' +
+    '<div class="estrellas" role="img" aria-label="' + n + ' de 5 estrellas">' + estrellas + '</div>' +
+    '<p data-campo="texto">' + escapar(t.texto) + '</p>' +
+    '<div class="test__pie">' + foto +
+      '<div class="test__quien"><b data-campo="nombre">' + escapar(t.nombre) + '</b>' +
+      '<span data-campo="ciudad">' + escapar(t.ciudad) + '</span></div></div>' +
+    '<div class="edTest">' +
+      '<label>Poner foto<input type="file" accept="image/*" data-foto="' + i + '"></label>' +
+      '<button type="button" data-quitarfoto="' + i + '">Quitar foto</button>' +
+      '<button type="button" class="borrar" data-borrar="' + i + '">Borrar</button>' +
+    '</div></article>';
+}
+
+function pintarTestimonios() {
+  const tope = D.testimoniosVisibles || 5;
+  const editando = document.body.classList.contains("editando");
+  const lista = editando ? D.testimonios : D.testimonios.slice(0, tope);
+  $("rejillaTest").innerHTML = lista.map(tarjetaTest).join("");
+
+  const hayMas = !editando && D.testimonios.length > tope;
+  $("verMas").hidden = !hayMas;
+  if (hayMas) {
+    $("txtVerMas").textContent = "Ver todos los testimonios (" + D.testimonios.length + ")";
+    $("modalTitulo").textContent = "Todos los testimonios (" + D.testimonios.length + ")";
+  }
+  if (editando) aplicarEditables();
+}
+pintarTestimonios();
+
+(function () {
+  const modal = $("modalTest");
+  $("btnVerMas").addEventListener("click", () => {
+    $("rejillaModal").innerHTML = D.testimonios.map(tarjetaTest).join("");
+    modal.classList.add("abierto");
+    document.body.classList.add("bloqueado");
+    $("cerrarModal").focus();
+  });
+  const cerrar = () => { modal.classList.remove("abierto"); document.body.classList.remove("bloqueado"); };
+  $("cerrarModal").addEventListener("click", cerrar);
+  modal.addEventListener("click", e => { if (e.target === modal) cerrar(); });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && modal.classList.contains("abierto")) cerrar();
+  });
+})();
+
+/* ════════════════════════════════════════════════════════════
+   AGENTE FLOTANTE
+   ════════════════════════════════════════════════════════════ */
+const Chat = (function () {
+  const agente = $("agente"), btn = $("btnAgente"), chat = $("chat");
+  const cuerpo = $("chatCuerpo"), opciones = $("chatOpciones");
+  let iniciado = false;
+
+  const mostrar = () => agente.classList.add("visible");
+  if ("IntersectionObserver" in window) {
+    const obs = new IntersectionObserver(es => {
+      es.forEach(e => { if (e.isIntersecting) { mostrar(); obs.disconnect(); } });
+    }, { threshold:.06 });
+    obs.observe($("calc"));
+  } else mostrar();
+
+  function burbuja(texto, quien) {
+    const d = document.createElement("div");
+    d.className = "msj msj--" + quien;
+    String(texto).split("\n\n").forEach((p, i) => {
+      if (i) { d.appendChild(document.createElement("br")); d.appendChild(document.createElement("br")); }
+      d.appendChild(document.createTextNode(p));
+    });
+    cuerpo.appendChild(d);
+    cuerpo.scrollTop = cuerpo.scrollHeight;
+  }
+  function escribiendo() {
+    const d = document.createElement("div");
+    d.className = "msj msj--bot escribiendo";
+    d.innerHTML = "<i></i><i></i><i></i>";
+    cuerpo.appendChild(d); cuerpo.scrollTop = cuerpo.scrollHeight;
+    return d;
+  }
+  function botonFinal() {
+    if (cuerpo.querySelector(".msj--cta")) return;
+    const d = document.createElement("div");
+    d.className = "msj msj--cta";
+    const a = document.createElement("a");
+    a.className = "btn"; a.href = "#agenda"; a.textContent = D.agente.textoCta;
+    a.addEventListener("click", cerrar);
+    d.appendChild(a); cuerpo.appendChild(d); cuerpo.scrollTop = cuerpo.scrollHeight;
+  }
+  function responder(p, conBoton) {
+    burbuja(p.pregunta, "yo");
+    const esp = escribiendo();
+    setTimeout(() => { esp.remove(); burbuja(p.respuesta, "bot");
+      if (conBoton) setTimeout(botonFinal, 260); }, menosMov ? 60 : 650);
+  }
+  function chips() {
+    opciones.innerHTML = "";
+    D.agente.preguntas.forEach(p => {
+      const b = document.createElement("button");
+      b.className = "chip"; b.type = "button"; b.textContent = p.pregunta;
+      b.addEventListener("click", () => responder(p, false));
+      opciones.appendChild(b);
+    });
+    const v = document.createElement("button");
+    v.className = "chip chip--verde"; v.type = "button";
+    v.textContent = D.agente.comoAgendar.pregunta;
+    v.addEventListener("click", () => responder(D.agente.comoAgendar, true));
+    opciones.appendChild(v);
+
+    const c = document.createElement("button");
+    c.className = "chip chip--creador"; c.type = "button";
+    c.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="4" y="10.5" width="16" height="10" rx="2"/><path d="M8 10.5V7a4 4 0 018 0v3.5"/></svg> Para creadores';
+    c.addEventListener("click", () => Panel.abrir());
+    opciones.appendChild(c);
+  }
+  function abrir() {
+    chat.classList.add("abierto");
+    agente.classList.add("oculto");
+    btn.setAttribute("aria-expanded", "true");
+    if (!iniciado) { iniciado = true; $("chatNombre").textContent = D.agente.nombre; burbuja(D.agente.saludo, "bot"); chips(); }
+    $("cerrarChat").focus();
+  }
+  function cerrar() {
+    chat.classList.remove("abierto");
+    $("creador").classList.remove("abierto");
+    agente.classList.remove("oculto");
+    btn.setAttribute("aria-expanded", "false");
+  }
+  btn.addEventListener("click", abrir);
+  $("globoAgente").addEventListener("click", abrir);
+  $("cerrarChat").addEventListener("click", cerrar);
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Escape") return;
+    if ($("creador").classList.contains("abierto")) $("creador").classList.remove("abierto");
+    else if (chat.classList.contains("abierto")) cerrar();
+  });
+  return { cerrar, refrescar(){ iniciado = false; cuerpo.innerHTML = ""; opciones.innerHTML = ""; } };
+})();
+
+/* ════════════════════════════════════════════════════════════
+   MODO EDICIÓN
+   ════════════════════════════════════════════════════════════ */
+function aplicarEditables() {
+  document.querySelectorAll("[data-edit]").forEach(el => {
+    el.setAttribute("contenteditable", "true");
+    el.setAttribute("spellcheck", "false");
+  });
+  document.querySelectorAll(".testimonio [data-campo]").forEach(el => {
+    el.setAttribute("contenteditable", "true");
+    el.setAttribute("spellcheck", "false");
+  });
+}
+
+function quitarEditables() {
+  document.querySelectorAll("[contenteditable]").forEach(el => el.removeAttribute("contenteditable"));
+}
+
+/* Recoge todo lo editado en la página y lo guarda en D */
+function recoger() {
+  D.textos = D.textos || {};
+  document.querySelectorAll("[data-edit]").forEach(el => {
+    D.textos[el.getAttribute("data-edit")] = el.innerHTML.trim();
+  });
+  document.querySelectorAll("#rejillaTest .testimonio").forEach(art => {
+    const i = +art.getAttribute("data-i");
+    if (!D.testimonios[i]) return;
+    const t = D.testimonios[i];
+    const g = c => { const e = art.querySelector('[data-campo="' + c + '"]'); return e ? e.textContent.trim() : ""; };
+    t.texto = g("texto"); t.nombre = g("nombre"); t.ciudad = g("ciudad");
+  });
+}
+
+const Edicion = {
+  activar() {
+    recogerPanel();
+    Chat.cerrar();
+    document.body.classList.add("editando");
+    document.querySelectorAll(".rev,.subrayado,.brillo").forEach(el => el.classList.add("visible"));
+    pintarTestimonios();
+    aplicarEditables();
+    window.scrollTo({ top:0, behavior:"smooth" });
+  },
+  salir() {
+    recoger();
+    quitarEditables();
+    document.body.classList.remove("editando");
+    pintarTestimonios();
+    Chat.refrescar();
+  }
+};
+
+$("edSalir").addEventListener("click", () => Edicion.salir());
+$("edDescargar").addEventListener("click", () => descargar());
+$("edAgregarTest").addEventListener("click", () => {
+  recoger();
+  D.testimonios.push({ texto:"Escribe aquí lo que dijo tu cliente.", nombre:"Nombre", ciudad:"Ciudad, estado", foto:"", estrellas:5 });
+  pintarTestimonios();
+});
+
+/* Estrellas, fotos y borrar dentro de las tarjetas */
+$("rejillaTest").addEventListener("click", e => {
+  if (!document.body.classList.contains("editando")) return;
+
+  const est = e.target.closest("[data-estrella]");
+  if (est) {
+    recoger();
+    D.testimonios[+est.getAttribute("data-i")].estrellas = +est.getAttribute("data-estrella");
+    pintarTestimonios();
+    return;
+  }
+  const bor = e.target.closest("[data-borrar]");
+  if (bor) {
+    recoger();
+    D.testimonios.splice(+bor.getAttribute("data-borrar"), 1);
+    pintarTestimonios();
+    return;
+  }
+  const qf = e.target.closest("[data-quitarfoto]");
+  if (qf) {
+    recoger();
+    D.testimonios[+qf.getAttribute("data-quitarfoto")].foto = "";
+    pintarTestimonios();
+  }
+});
+
+/* Foto: se reduce a 200px para que el archivo no engorde */
+$("rejillaTest").addEventListener("change", e => {
+  const inp = e.target.closest("[data-foto]");
+  if (!inp || !inp.files || !inp.files[0]) return;
+  const i = +inp.getAttribute("data-foto");
+  const lector = new FileReader();
+  lector.onload = ev => {
+    const img = new Image();
+    img.onload = () => {
+      const L = 200;
+      const lienzo = document.createElement("canvas");
+      lienzo.width = lienzo.height = L;
+      const ctx = lienzo.getContext("2d");
+      const lado = Math.min(img.width, img.height);
+      ctx.drawImage(img, (img.width-lado)/2, (img.height-lado)/2, lado, lado, 0, 0, L, L);
+      recoger();
+      D.testimonios[i].foto = lienzo.toDataURL("image/jpeg", .82);
+      pintarTestimonios();
+    };
+    img.src = ev.target.result;
+  };
+  lector.readAsDataURL(inp.files[0]);
+});
+
+/* ════════════════════════════════════════════════════════════
+   PANEL PARA CREADORES
+   ════════════════════════════════════════════════════════════ */
+function pintarQA() {
+  const cont = $("cListaQA");
+  cont.innerHTML = "";
+  D.agente.preguntas.forEach((p, i) => {
+    const d = document.createElement("div");
+    d.className = "qa";
+    d.innerHTML =
+      '<div class="campo"><label>Pregunta ' + (i+1) + '</label>' +
+      '<input type="text" data-qp="' + i + '" value="' + escapar(p.pregunta) + '"></div>' +
+      '<div class="campo"><label>Respuesta</label><textarea data-qr="' + i + '">' + escapar(p.respuesta) + '</textarea></div>' +
+      '<button type="button" class="qa__borrar" data-qb="' + i + '">Borrar esta pregunta</button>';
+    cont.appendChild(d);
+  });
+  cont.querySelectorAll("[data-qb]").forEach(b => {
+    b.addEventListener("click", () => {
+      recogerPanel();
+      D.agente.preguntas.splice(+b.getAttribute("data-qb"), 1);
+      pintarQA();
+    });
+  });
+}
+
+function recogerPanel() {
+  D.calendlyUrl = $("cCalendly").value.trim();
+  D.videoUrl = $("cVideo").value.trim();
+  D.musicaUrl = $("cMusica").value.trim();
+  D.musicaVolumen = +$("cVolumen").value / 100;
+  D.agente.nombre = $("cAgNombre").value.trim();
+  D.agente.saludo = $("cAgSaludo").value.trim();
+  D.agente.comoAgendar.pregunta = $("cAgComoP").value.trim();
+  D.agente.comoAgendar.respuesta = $("cAgComoR").value;
+  document.querySelectorAll("[data-qp]").forEach(inp => {
+    const i = +inp.getAttribute("data-qp");
+    if (D.agente.preguntas[i]) D.agente.preguntas[i].pregunta = inp.value.trim();
+  });
+  document.querySelectorAll("[data-qr]").forEach(ta => {
+    const i = +ta.getAttribute("data-qr");
+    if (D.agente.preguntas[i]) D.agente.preguntas[i].respuesta = ta.value;
+  });
+}
+
+function llenarPanel() {
+  $("cCalendly").value = D.calendlyUrl || "";
+  $("cVideo").value = D.videoUrl || "";
+  $("cMusica").value = D.musicaUrl || "";
+  const v = Math.round((D.musicaVolumen || .25) * 100);
+  $("cVolumen").value = v; $("cVolTxt").textContent = v + "%";
+  $("cAgNombre").value = D.agente.nombre || "";
+  $("cAgSaludo").value = D.agente.saludo || "";
+  $("cAgComoP").value = D.agente.comoAgendar.pregunta || "";
+  $("cAgComoR").value = D.agente.comoAgendar.respuesta || "";
+  pintarQA();
+}
+
+const Panel = {
+  abrir() {
+    $("creador").classList.add("abierto");
+    $("creadorLlave").hidden = false;
+    $("creadorPanel").hidden = true;
+    $("creadorClave").value = "";
+    $("creadorErr").textContent = "";
+    $("creadorTitulo").textContent = "Para creadores";
+    setTimeout(() => $("creadorClave").focus(), 80);
+  },
+  cerrar() { $("creador").classList.remove("abierto"); }
+};
+
+function entrarPanel() {
+  if (huella($("creadorClave").value.trim()) === D.huellaClave) {
+    $("creadorLlave").hidden = true;
+    $("creadorPanel").hidden = false;
+    $("creadorTitulo").textContent = "Panel del administrador";
+    llenarPanel();
+  } else {
+    $("creadorErr").textContent = "Contraseña incorrecta.";
+    $("creadorClave").value = "";
+  }
+}
+
+$("creadorEntrar").addEventListener("click", entrarPanel);
+$("creadorClave").addEventListener("keydown", e => { if (e.key === "Enter") entrarPanel(); });
+$("creadorVolver").addEventListener("click", () => Panel.cerrar());
+$("cVolumen").addEventListener("input", e => { $("cVolTxt").textContent = e.target.value + "%"; });
+
+$("cProbar").addEventListener("click", () => {
+  const url = $("cMusica").value.trim();
+  if (!url) { $("creadorOk").textContent = "Escribe primero el nombre del archivo."; return; }
+  Musica.probar(url, +$("cVolumen").value / 100);
+  $("creadorOk").textContent = "Sonando. Si no escuchas nada, revisa que el archivo esté subido junto a la página.";
+});
+
+$("cAgregarQA").addEventListener("click", () => {
+  recogerPanel();
+  D.agente.preguntas.push({ pregunta:"Nueva pregunta", respuesta:"Escribe aquí la respuesta." });
+  pintarQA();
+});
+
+$("creadorEditar").addEventListener("click", () => Edicion.activar());
+$("cDescargar").addEventListener("click", () => { recogerPanel(); descargar(); });
+
+$("cDesconectar").addEventListener("click", () => {
+  recogerPanel();
+  if (document.body.classList.contains("editando")) Edicion.salir();
+  $("creadorLlave").hidden = false;
+  $("creadorPanel").hidden = true;
+  $("creadorClave").value = "";
+  $("creadorTitulo").textContent = "Para creadores";
+  Panel.cerrar();
+  Chat.cerrar();
+  montarVideo(); montarCalendly();
+  $("creadorOk").textContent = "";
+});
+
+/* ════════════════════════════════════════════════════════════
+   DESCARGAR LA PÁGINA ACTUALIZADA
+   Toma el archivo original y solo le cambia el bloque de datos.
+   Todo lo demás queda intacto.
+   ════════════════════════════════════════════════════════════ */
+function descargar() {
+  if (document.body.classList.contains("editando")) recoger();
+
+  const nuevo = JSON.stringify(D, null, 2);
+  const abre = '<script id="datos" type="application/json">';
+  const ini = FUENTE.indexOf(abre);
+  const fin = FUENTE.indexOf("<\/script>", ini);
+
+  if (ini === -1 || fin === -1) {
+    alert("No se pudo preparar el archivo. Copia tus cambios a mano.");
+    return;
+  }
+
+  const salida = FUENTE.slice(0, ini + abre.length) + "\n" + nuevo + "\n" + FUENTE.slice(fin);
+  const blob = new Blob([salida], { type:"text/html;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "index.html";
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+
+  $("creadorOk").textContent = "Descargado. Sube este index.html a Netlify para publicarlo.";
+}
+
+/* ════════════════════════════════════════════════════════════
+   APARICIONES + realce táctil
+   ════════════════════════════════════════════════════════════ */
+(function () {
+  const objetivos = document.querySelectorAll(".rev, .subrayado, .brillo");
+  if (!("IntersectionObserver" in window) || menosMov) {
+    objetivos.forEach(el => el.classList.add("visible"));
+  } else {
+    const obs = new IntersectionObserver(ents => {
+      let n = 0;
+      ents.forEach(e => {
+        if (!e.isIntersecting) return;
+        e.target.style.transitionDelay = (n * 90) + "ms";
+        e.target.classList.add("visible");
+        obs.unobserve(e.target); n++;
+      });
+    }, { threshold:.12, rootMargin:"0px 0px -60px 0px" });
+    objetivos.forEach(el => obs.observe(el));
+  }
+
+  document.querySelectorAll(".col").forEach(col => {
+    col.addEventListener("touchstart", () => {
+      if (document.body.classList.contains("editando")) return;
+      document.querySelectorAll(".col").forEach(o => o.classList.remove("tocada"));
+      col.classList.add("tocada");
+    }, { passive:true });
+  });
+})();
+
+/* Inclinación de los testimonios (solo escritorio, fuera de edición) */
+(function () {
+  if (menosMov || !matchMedia("(hover:hover)").matches) return;
+  document.addEventListener("mousemove", e => {
+    if (document.body.classList.contains("editando")) return;
+    const t = e.target.closest(".testimonio");
+    if (!t) return;
+    const r = t.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width - .5;
+    const y = (e.clientY - r.top) / r.height - .5;
+    t.style.transform = "perspective(900px) rotateX(" + (-y*4) + "deg) rotateY(" + (x*4) + "deg) translateY(-4px)";
+  });
+  document.addEventListener("mouseout", e => {
+    const t = e.target.closest(".testimonio");
+    if (t) t.style.transform = "";
+  });
+})();
+
+/* Resplandores con el scroll */
+(function () {
+  if (menosMov) return;
+  const halos = document.querySelectorAll(".halo");
+  let pend = false;
+  addEventListener("scroll", () => {
+    if (pend) return;
+    pend = true;
+    requestAnimationFrame(() => {
+      const y = scrollY;
+      halos.forEach((h, i) => {
+        const c = h.classList.contains("calc__halo") || h.classList.contains("cierre__halo");
+        h.style.transform = (c ? "translateX(-50%) " : "") + "translateY(" + (y * (i % 2 === 0 ? .06 : -.045)) + "px)";
+      });
+      pend = false;
+    });
+  }, { passive:true });
+})();
+</script></body></html>
